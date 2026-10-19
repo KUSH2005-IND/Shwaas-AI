@@ -1,6 +1,5 @@
-# src/api.py (Top section update)
+# src/api.py
 import os
-import io
 import base64
 import tempfile
 from pathlib import Path
@@ -12,7 +11,7 @@ import scipy.signal as signal
 import torch
 from fastapi import FastAPI, UploadFile, File, Form, Query
 from fastapi.responses import JSONResponse
-from huggingface_hub import hf_hub_download # <-- ADD THIS IMPORT
+from huggingface_hub import hf_hub_download
 
 from src.model import LateFusionTBModel
 from src.gradcam import GradCAM
@@ -33,35 +32,33 @@ FILENAME = "late_fusion_model.pth"
 
 print(f"📥 Checking for model weights in cache or downloading from {REPO_ID}...")
 try:
-    # This automatically downloads the file and caches it locally for future runs
     model_path = hf_hub_download(repo_id=REPO_ID, filename=FILENAME, cache_dir=str(CACHE_DIR))
     print("✅ Model weights loaded successfully from Hugging Face!")
 except Exception as e:
-    print(f"⚠️ Could not download from Hugging Face: {e}")
+    print(f"️ Could not download from Hugging Face: {e}")
     print("Falling back to local cache...")
     model_path = CACHE_DIR / FILENAME
 
 model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
 model.eval()
 
-# ... [Rest of your api.py remains exactly the same as before] ...
-
 target_layer = model.audio_encoder.backbone.features[-1][0]
 gradcam = GradCAM(model, target_layer)
 
 
-# --- AUDIO PROCESSING ---
+# --- AUDIO PROCESSING HELPERS ---
 def preprocess_audio(y, sr=16000):
     if sr != 16000:
         y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+    # Bandpass filter (300Hz - 6000Hz) to isolate cough frequencies
     nyq = 0.5 * 16000
     b, a = signal.butter(4, [300.0 / nyq, 6000.0 / nyq], btype='band')
     y = signal.filtfilt(b, a, y)
     y, _ = librosa.effects.trim(y, top_db=30)
     rms = np.sqrt(np.mean(y ** 2))
     if rms > 1e-5:
-        y = y / (rms * 5.0)
-    target_len = int(16000 * 3.0)
+        y = y / (rms * 5.0)  # Loudness normalization
+    target_len = int(16000 * 3.0)  # 3 seconds
     if len(y) < target_len:
         y = np.pad(y, (0, target_len - len(y)))
     else:
@@ -78,8 +75,30 @@ def audio_to_tensor(y):
     return torch.tensor(img_rgb, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
 
 
+# --- NEW: AUDIO QUALITY GATE ---
+def audio_quality_gate(y: np.ndarray, max_amplitude: float = 0.99, min_rms: float = 0.005):
+    """
+    Rejects audio that is clipping (distorted) or too quiet (silence).
+    Returns: (is_valid: bool, message: str)
+    """
+    # 1. Check for clipping (digital distortion)
+    if np.max(np.abs(y)) >= max_amplitude:
+        return False, "Audio is clipping (distorted). Please move the microphone further away."
+
+    # 2. Check for silence / low signal level
+    rms = np.sqrt(np.mean(y ** 2))
+    if rms < min_rms:
+        return False, "Audio is too quiet. Please ensure the microphone is close to the patient."
+
+    return True, "Audio quality passed."
+
+
 # --- UNCERTAINTY-AWARE CLINICAL SCORER ---
 def calculate_clinical_score(q1, q2, q3, q4):
+    """
+    WHO-aligned TB Symptom Scorer with Uncertainty Handling.
+    Inputs: 0 (No), 1 (Yes), 2 (Unsure/Unknown)
+    """
     score = 0
     unknown_flags = []
 
@@ -92,33 +111,10 @@ def calculate_clinical_score(q1, q2, q3, q4):
         else:
             return 0
 
-    score += evaluate(q1, 2, "unintended_weight_loss")  # Adjusted mapping for schema
-    # Note: Adjusting the exact string names to match standard clinical IDs
-    # q1: Cough > 2w, q2: Weight loss, q3: Night sweats, q4: TB contact
-    # Let's map them strictly:
-    unknown_flags.clear()  # reset
-    score = 0
-
-    # Re-mapping for strict clinical IDs
-    if q1 == 1:
-        score += 2
-    elif q1 == 2:
-        unknown_flags.append("cough_duration")
-
-    if q2 == 1:
-        score += 1
-    elif q2 == 2:
-        unknown_flags.append("unintended_weight_loss")
-
-    if q3 == 1:
-        score += 1
-    elif q3 == 2:
-        unknown_flags.append("night_sweats_fever")
-
-    if q4 == 1:
-        score += 2
-    elif q4 == 2:
-        unknown_flags.append("tb_contact")
+    score += evaluate(q1, 2, "cough_duration")
+    score += evaluate(q2, 1, "unintended_weight_loss")
+    score += evaluate(q3, 1, "night_sweats_fever")
+    score += evaluate(q4, 2, "tb_contact")
 
     if score <= 1:
         clinical_tier = "LOW"
@@ -150,6 +146,17 @@ async def predict(
 
         try:
             y, sr = librosa.load(tmp_path, sr=16000, mono=True)
+
+            # --- QUALITY GATE ---
+            is_valid, message = audio_quality_gate(y)
+            if not is_valid:
+                return JSONResponse(status_code=400, content={
+                    "status": "error",
+                    "message": message,
+                    "action": "request_new_recording"
+                })
+            # ---------------------
+
             y_clean = preprocess_audio(y, sr)
             audio_tensor = audio_to_tensor(y_clean).to(device)
         finally:
@@ -169,15 +176,11 @@ async def predict(
         verification_status = "verified"
         next_action = "proceed_to_triage"
 
-        # If there are unknown flags, the result is PROVISIONAL
         if unknown_flags:
             fusion_status = "provisional"
             verification_status = "clarification_required"
             next_action = "ask_clarifying_question"
-            # We do NOT escalate the tier if the clinical data is incomplete.
-            # We wait for the ASHA worker to resolve it.
         else:
-            # Only escalate if data is fully verified
             if audio_prob > 0.65:
                 if clinical_tier == "LOW":
                     final_tier = "MODERATE"
@@ -220,7 +223,7 @@ async def predict(
         # 7. Optional Heavy Payload (Grad-CAM)
         if include_gradcam:
             heatmap = gradcam.generate_cam(audio_tensor, tabular_zeros)
-            _, buffer = cv2.imencode('.jpg', heatmap, [cv2.IMWRITE_JPEG_QUALITY, 60])  # Compress to save bandwidth
+            _, buffer = cv2.imencode('.jpg', heatmap, [cv2.IMWRITE_JPEG_QUALITY, 60])
             heatmap_b64 = base64.b64encode(buffer).decode('utf-8')
             response_payload["gradcam_image"] = f"data:image/jpeg;base64,{heatmap_b64}"
 
