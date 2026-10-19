@@ -1,0 +1,9 @@
+{
+  "model": "Late_Fusion_CNN",
+  "task": "respiratory_abnormality_proxy",
+  "auroc": 0.9536682728647015,
+  "average_precision": 0.9169145670464944,
+  "sensitivity_at_90_specificity": 0.0,
+  "threshold": Infinity,
+  "test_participants": 325
+}

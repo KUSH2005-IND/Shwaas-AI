@@ -1,0 +1,9 @@
+{
+  "model": "Audio_CNN_Only (Tabular input zeroed)",
+  "task": "respiratory_abnormality_proxy",
+  "auroc": 0.7911352040816326,
+  "average_precision": 0.6254101469030235,
+  "sensitivity_at_90_specificity": 0.0,
+  "threshold": Infinity,
+  "test_participants": 325
+}

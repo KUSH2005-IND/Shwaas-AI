@@ -1,0 +1,18 @@
+{
+  "experiment": "C_statistical_baseline",
+  "task": "respiratory_abnormality_PROXY_NOT_TB",
+  "n_recordings": 3188,
+  "n_participants": 3188,
+  "cv_auc": 0.6676128111075552,
+  "test_auc": 0.6809878419452888,
+  "test_auc_ci": [
+    0.627648704309269,
+    0.7297780236128478
+  ],
+  "average_precision": 0.4816477272118733,
+  "sensitivity_at_90_specificity": 0.2723404255319149,
+  "threshold": 0.6506773000078033,
+  "brier_uncalibrated": 0.22413085407015165,
+  "split": "participant_grouped_75_25",
+  "seed": 42
+}

@@ -1,0 +1,80 @@
+# ==========================================
+# Python Artifacts & Bytecode
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# ==========================================
+# Virtual Environments (uv / venv)
+# ==========================================
+.venv/
+venv/
+ENV/
+env/
+
+# ==========================================
+# IDE & Editor Settings (PyCharm / VS Code)
+# ==========================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ==========================================
+# Project Specific: ShwaasAI Data & Cache
+# (CRITICAL: These files are massive and must NOT be in Git)
+# ==========================================
+data/
+cache/
+.cache/
+
+# Ignore specific large file types just in case they leak into the root folder
+*.pt
+*.pth
+*.parquet
+*.wav
+*.mp3
+*.m4a
+*.npy
+*.joblib
+
+# ==========================================
+# Hugging Face & Local Caches
+# ==========================================
+hf_cache/
+hub/
+snapshots/
+
+# ==========================================
+# OS Generated Files
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# Jupyter Notebooks (Prevent merge conflicts)
+# ==========================================
+.ipynb_checkpoints/
+*.ipynb
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.local
+*.key
+*.pem
