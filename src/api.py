@@ -16,7 +16,7 @@ from huggingface_hub import hf_hub_download
 from src.model import LateFusionTBModel
 from src.gradcam import GradCAM
 
-app = FastAPI(title="ShwaasAI Triage API")
+app = FastAPI(title="ShwaasAI Two-Channel Triage API")
 
 # --- SETUP ---
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -35,7 +35,7 @@ try:
     model_path = hf_hub_download(repo_id=REPO_ID, filename=FILENAME, cache_dir=str(CACHE_DIR))
     print("✅ Model weights loaded successfully from Hugging Face!")
 except Exception as e:
-    print(f"️ Could not download from Hugging Face: {e}")
+    print(f"⚠️ Could not download from Hugging Face: {e}")
     print("Falling back to local cache...")
     model_path = CACHE_DIR / FILENAME
 
@@ -75,17 +75,12 @@ def audio_to_tensor(y):
     return torch.tensor(img_rgb, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
 
 
-# --- NEW: AUDIO QUALITY GATE ---
+# --- AUDIO QUALITY GATE ---
 def audio_quality_gate(y: np.ndarray, max_amplitude: float = 0.99, min_rms: float = 0.005):
-    """
-    Rejects audio that is clipping (distorted) or too quiet (silence).
-    Returns: (is_valid: bool, message: str)
-    """
-    # 1. Check for clipping (digital distortion)
+    """Rejects audio that is clipping (distorted) or too quiet (silence)."""
     if np.max(np.abs(y)) >= max_amplitude:
         return False, "Audio is clipping (distorted). Please move the microphone further away."
 
-    # 2. Check for silence / low signal level
     rms = np.sqrt(np.mean(y ** 2))
     if rms < min_rms:
         return False, "Audio is too quiet. Please ensure the microphone is close to the patient."
@@ -93,52 +88,75 @@ def audio_quality_gate(y: np.ndarray, max_amplitude: float = 0.99, min_rms: floa
     return True, "Audio quality passed."
 
 
-# --- UNCERTAINTY-AWARE CLINICAL SCORER ---
-def calculate_clinical_score(q1, q2, q3, q4):
+# --- TWO-CHANNEL WEIGHTED CLINICAL SCORER ---
+def calculate_clinical_score(
+        cough_duration: int,  # 0=None, 1=<2wks, 2=≥2wks
+        fever: int,  # 0=No, 1=Yes
+        night_sweats: int,  # 0=No, 1=Yes
+        weight_loss: int,  # 0=No, 2=Yes (unexplained)
+        hemoptysis: int,  # 0=No, 2=Yes
+        tb_contact: int,  # 0=No, 3=Yes
+        diabetes: int,  # 0=No, 1=Yes
+        hiv: int,  # 0=No, 2=Yes
+        immunosuppression: int,  # 0=No, 2=Yes
+        silica_exposure: int  # 0=No, 2=Yes
+):
     """
-    WHO-aligned TB Symptom Scorer with Uncertainty Handling.
-    Inputs: 0 (No), 1 (Yes), 2 (Unsure/Unknown)
+    WHO-aligned Weighted Clinical Scoring (Provisional Prototype).
+    Maximum Score: 18 points.
+    Returns: (score, red_flag_status, high_risk_status)
     """
     score = 0
-    unknown_flags = []
+    score += cough_duration
+    score += fever
+    score += night_sweats
+    score += weight_loss
+    score += hemoptysis
+    score += tb_contact
+    score += diabetes
+    score += hiv
+    score += immunosuppression
+    score += silica_exposure
 
-    def evaluate(q_val, points, name):
-        if q_val == 1:
-            return points
-        elif q_val == 2:
-            unknown_flags.append(name)
-            return 0
-        else:
-            return 0
+    # Safety Overrides
+    red_flag = (hemoptysis == 2)  # Blood = Urgent
+    high_risk = (hiv == 2 or immunosuppression == 2 or tb_contact == 3)
 
-    score += evaluate(q1, 2, "cough_duration")
-    score += evaluate(q2, 1, "unintended_weight_loss")
-    score += evaluate(q3, 1, "night_sweats_fever")
-    score += evaluate(q4, 2, "tb_contact")
-
-    if score <= 1:
-        clinical_tier = "LOW"
-    elif score <= 3:
-        clinical_tier = "MODERATE"
-    else:
-        clinical_tier = "HIGH"
-
-    return score, clinical_tier, unknown_flags
+    return score, red_flag, high_risk
 
 
 # --- API ENDPOINT ---
 @app.post("/predict")
 async def predict(
         file: UploadFile = File(...),
-        q1: int = Form(0),
-        q2: int = Form(0),
-        q3: int = Form(0),
-        q4: int = Form(0),
-        include_gradcam: bool = Query(False,
-                                      description="Set to true to include the heavy base64 heatmap in the response.")
+        # --- NEW: Bias-Aware Demographic Routing ---
+        age: int = Form(18, description="Patient age in years. Used for routing only, not scoring."),
+        sex: str = Form("prefer_not_to_say", description="Patient sex/gender. Used for records only, not scoring."),
+
+        # --- 10-Question Clinical Parameters ---
+        cough_duration: int = Form(0, description="0=None, 1=<2wks, 2=≥2wks"),
+        fever: int = Form(0, description="0=No, 1=Yes"),
+        night_sweats: int = Form(0, description="0=No, 1=Yes"),
+        weight_loss: int = Form(0, description="0=No, 2=Yes"),
+        hemoptysis: int = Form(0, description="0=No, 2=Yes (Red Flag)"),
+        tb_contact: int = Form(0, description="0=No, 3=Yes"),
+        diabetes: int = Form(0, description="0=No, 1=Yes"),
+        hiv: int = Form(0, description="0=No, 2=Yes"),
+        immunosuppression: int = Form(0, description="0=No, 2=Yes"),
+        silica_exposure: int = Form(0, description="0=No, 2=Yes"),
+
+        include_gradcam: bool = Query(False, description="Set to true to include the heavy base64 heatmap.")
 ):
     try:
-        # 1. Audio Processing
+        # 1. AGE ROUTING (Pediatric Safety Check)
+        if age < 18:
+            return JSONResponse(status_code=400, content={
+                "status": "error",
+                "message": "Patient is under 18. Pediatric TB screening requires a different clinical pathway.",
+                "action": "route_to_pediatric_protocol"
+            })
+
+        # 2. Audio Processing
         contents = await file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
             tmp_file.write(contents)
@@ -155,69 +173,83 @@ async def predict(
                     "message": message,
                     "action": "request_new_recording"
                 })
-            # ---------------------
 
             y_clean = preprocess_audio(y, sr)
             audio_tensor = audio_to_tensor(y_clean).to(device)
         finally:
             os.unlink(tmp_path)
 
-        # 2. AI Audio Inference
+        # 3. AI Audio Inference (Isolate audio score by passing zeros to tabular branch)
         with torch.no_grad():
             tabular_zeros = torch.zeros((1, 4), dtype=torch.float32).to(device)
             audio_prob = model(audio_tensor, tabular_zeros).item()
 
-            # 3. Clinical Scoring
-        clinical_score, clinical_tier, unknown_flags = calculate_clinical_score(q1, q2, q3, q4)
+            # 4. Two-Channel Clinical Scoring
+        clinical_score, red_flag, high_risk = calculate_clinical_score(
+            cough_duration, fever, night_sweats, weight_loss,
+            hemoptysis, tb_contact, diabetes, hiv,
+            immunosuppression, silica_exposure
+        )
 
-        # 4. HYBRID FUSION & VERIFICATION LOGIC
-        final_tier = clinical_tier
-        fusion_status = "finalized"
-        verification_status = "verified"
-        next_action = "proceed_to_triage"
-
-        if unknown_flags:
-            fusion_status = "provisional"
-            verification_status = "clarification_required"
-            next_action = "ask_clarifying_question"
+        # 5. Transparent Routing Logic (No blind addition of scores)
+        if red_flag:
+            final_tier = "URGENT"
+            action = "Immediate medical assessment required (hemoptysis detected)."
+            fusion_status = "safety_override"
+        elif high_risk and clinical_score <= 3:
+            # Asymptomatic or low-symptom but high-risk (e.g., TB contact, HIV)
+            final_tier = "HIGH_RISK_SCREENING"
+            action = "Contact screening or high-risk pathway referral recommended."
+            fusion_status = "risk_based_referral"
         else:
-            if audio_prob > 0.65:
+            # Standard tiering based on weighted score
+            if clinical_score <= 3:
+                clinical_tier = "LOW"
+            elif clinical_score <= 8:
+                clinical_tier = "MODERATE"
+            else:
+                clinical_tier = "HIGH"
+
+            # Audio can escalate but NEVER downgrade
+            final_tier = clinical_tier
+            if audio_prob > 0.65 and clinical_tier != "HIGH":
                 if clinical_tier == "LOW":
                     final_tier = "MODERATE"
                 elif clinical_tier == "MODERATE":
                     final_tier = "HIGH"
 
-        # 5. Determine Safe Recommended Action
-        if verification_status == "clarification_required":
-            action = f"Resolve uncertain responses ({', '.join(unknown_flags)}). Do not rule out TB based on audio score alone."
-        elif final_tier == "HIGH":
-            action = "Urgent referral for CBNAAT testing recommended."
-        elif final_tier == "MODERATE":
-            action = "Clinical evaluation recommended. Persistent cough warrants PHC visit regardless of acoustic score."
-        else:
-            action = "Low immediate risk. Maintain standard respiratory hygiene."
+            fusion_status = "finalized"
 
-        # 6. Build the Traceable Response Schema
+            if final_tier == "HIGH":
+                action = "Urgent referral for CBNAAT testing recommended."
+            elif final_tier == "MODERATE":
+                action = "Clinical evaluation recommended. Persistent cough warrants PHC visit."
+            else:
+                action = "Low immediate risk. Maintain standard respiratory hygiene."
+
+        # 6. Build the Traceable, Two-Channel Response Schema
         response_payload = {
             "status": "success",
-            "clinical_score": clinical_score,
-            "clinical_tier": clinical_tier,
-            "uncertain_symptoms": unknown_flags,
-            "verification": {
-                "status": verification_status,
-                "question_id": unknown_flags[0] if unknown_flags else None,
-                "next_action": next_action
+            "patient_demographics": {
+                "age": age,
+                "sex": sex,
+                "bias_note": "Demographics collected for record-keeping only. Excluded from scoring to prevent algorithmic bias."
             },
+            "questionnaire_score": clinical_score,
+            "questionnaire_max": 18,
+            "red_flag_detected": red_flag,
+            "high_risk_factors_present": high_risk,
             "audio_model": {
-                "target": "audio_abnormality_proxy",
+                "target": "respiratory_abnormality_proxy",
                 "score": round(audio_prob, 4),
-                "tb_probability_validated": False
+                "tb_probability_validated": False  # CRITICAL DISCLAIMER
             },
             "fusion": {
                 "status": fusion_status,
                 "tier": final_tier
             },
-            "recommended_action": action
+            "recommended_pathway": action,
+            "clinical_note": "This is a screening support tool, not a diagnostic. Final decision requires clinician review."
         }
 
         # 7. Optional Heavy Payload (Grad-CAM)
