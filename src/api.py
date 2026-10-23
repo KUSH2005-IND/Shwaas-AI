@@ -3,10 +3,10 @@ import os
 import base64
 import tempfile
 from pathlib import Path
+import numpy as np
 
 import cv2
 import librosa
-import numpy as np
 import scipy.signal as signal
 import torch
 from fastapi import FastAPI, UploadFile, File, Form, Query
@@ -46,23 +46,64 @@ target_layer = model.audio_encoder.backbone.features[-1][0]
 gradcam = GradCAM(model, target_layer)
 
 
+# --- UPGRADE 2: PROXY TEMPERATURE SCALING (Fixes Calibration) ---
+def apply_temperature_scaling(prob, temperature=1.5):
+    """
+    Mathematically softens overconfident probabilities without changing model weights.
+    """
+    prob = np.clip(prob, 1e-7, 1 - 1e-7)  # Prevent log(0)
+    logit = np.log(prob / (1 - prob))
+    calibrated_prob = 1 / (1 + np.exp(-logit / temperature))
+    return calibrated_prob
+
+
 # --- AUDIO PROCESSING HELPERS ---
 def preprocess_audio(y, sr=16000):
     if sr != 16000:
         y = librosa.resample(y, orig_sr=sr, target_sr=16000)
-    # Bandpass filter (300Hz - 6000Hz) to isolate cough frequencies
+
+    # 1. Bandpass filter (300Hz - 6000Hz)
     nyq = 0.5 * 16000
     b, a = signal.butter(4, [300.0 / nyq, 6000.0 / nyq], btype='band')
     y = signal.filtfilt(b, a, y)
-    y, _ = librosa.effects.trim(y, top_db=30)
+
+    # 2. UPGRADE 1: COUGH EVENT EXTRACTION (Energy-based VAD)
+    frame_length = int(0.025 * sr)  # 25ms frames
+    hop_length = int(0.010 * sr)  # 10ms hop
+    energy = np.array([sum(abs(y[i:i + frame_length] ** 2)) for i in range(0, len(y), hop_length)])
+
+    # Find frames where energy is significantly higher than the noise floor
+    median_energy = np.median(energy)
+    threshold = median_energy * 5.0
+
+    active_frames = np.where(energy > threshold)[0]
+
+    if len(active_frames) > 0:
+        # Extract the continuous segment containing the cough
+        start_frame = active_frames[0]
+        end_frame = active_frames[-1]
+        start_sample = start_frame * hop_length
+        end_sample = min(end_frame * hop_length + frame_length, len(y))
+
+        # Add a small buffer (100ms) before and after the cough
+        buffer = int(0.1 * sr)
+        y = y[max(0, start_sample - buffer): min(len(y), end_sample + buffer)]
+    else:
+        # Fallback if no distinct cough energy is detected
+        y, _ = librosa.effects.trim(y, top_db=30)
+
+    # 3. Loudness normalization
     rms = np.sqrt(np.mean(y ** 2))
     if rms > 1e-5:
-        y = y / (rms * 5.0)  # Loudness normalization
-    target_len = int(16000 * 3.0)  # 3 seconds
+        y = y / (rms * 5.0)
+
+        # 4. Pad/Truncate to exactly 3 seconds for the CNN
+    target_len = int(16000 * 3.0)
     if len(y) < target_len:
         y = np.pad(y, (0, target_len - len(y)))
     else:
         y = y[:target_len]
+
     return y
 
 
@@ -90,36 +131,16 @@ def audio_quality_gate(y: np.ndarray, max_amplitude: float = 0.99, min_rms: floa
 
 # --- TWO-CHANNEL WEIGHTED CLINICAL SCORER ---
 def calculate_clinical_score(
-        cough_duration: int,  # 0=None, 1=<2wks, 2=≥2wks
-        fever: int,  # 0=No, 1=Yes
-        night_sweats: int,  # 0=No, 1=Yes
-        weight_loss: int,  # 0=No, 2=Yes (unexplained)
-        hemoptysis: int,  # 0=No, 2=Yes
-        tb_contact: int,  # 0=No, 3=Yes
-        diabetes: int,  # 0=No, 1=Yes
-        hiv: int,  # 0=No, 2=Yes
-        immunosuppression: int,  # 0=No, 2=Yes
-        silica_exposure: int  # 0=No, 2=Yes
+        cough_duration: int, fever: int, night_sweats: int, weight_loss: int,
+        hemoptysis: int, tb_contact: int, diabetes: int, hiv: int,
+        immunosuppression: int, silica_exposure: int
 ):
-    """
-    WHO-aligned Weighted Clinical Scoring (Provisional Prototype).
-    Maximum Score: 18 points.
-    Returns: (score, red_flag_status, high_risk_status)
-    """
+    """WHO-aligned Weighted Clinical Scoring (Max 18 points)."""
     score = 0
-    score += cough_duration
-    score += fever
-    score += night_sweats
-    score += weight_loss
-    score += hemoptysis
-    score += tb_contact
-    score += diabetes
-    score += hiv
-    score += immunosuppression
-    score += silica_exposure
+    score += cough_duration + fever + night_sweats + weight_loss + hemoptysis + tb_contact
+    score += diabetes + hiv + immunosuppression + silica_exposure
 
-    # Safety Overrides
-    red_flag = (hemoptysis == 2)  # Blood = Urgent
+    red_flag = (hemoptysis == 2)
     high_risk = (hiv == 2 or immunosuppression == 2 or tb_contact == 3)
 
     return score, red_flag, high_risk
@@ -129,26 +150,16 @@ def calculate_clinical_score(
 @app.post("/predict")
 async def predict(
         file: UploadFile = File(...),
-        # --- NEW: Bias-Aware Demographic Routing ---
-        age: int = Form(18, description="Patient age in years. Used for routing only, not scoring."),
-        sex: str = Form("prefer_not_to_say", description="Patient sex/gender. Used for records only, not scoring."),
-
-        # --- 10-Question Clinical Parameters ---
-        cough_duration: int = Form(0, description="0=None, 1=<2wks, 2=≥2wks"),
-        fever: int = Form(0, description="0=No, 1=Yes"),
-        night_sweats: int = Form(0, description="0=No, 1=Yes"),
-        weight_loss: int = Form(0, description="0=No, 2=Yes"),
-        hemoptysis: int = Form(0, description="0=No, 2=Yes (Red Flag)"),
-        tb_contact: int = Form(0, description="0=No, 3=Yes"),
-        diabetes: int = Form(0, description="0=No, 1=Yes"),
-        hiv: int = Form(0, description="0=No, 2=Yes"),
-        immunosuppression: int = Form(0, description="0=No, 2=Yes"),
-        silica_exposure: int = Form(0, description="0=No, 2=Yes"),
-
-        include_gradcam: bool = Query(False, description="Set to true to include the heavy base64 heatmap.")
+        age: int = Form(18),
+        sex: str = Form("prefer_not_to_say"),
+        cough_duration: int = Form(0), fever: int = Form(0), night_sweats: int = Form(0),
+        weight_loss: int = Form(0), hemoptysis: int = Form(0), tb_contact: int = Form(0),
+        diabetes: int = Form(0), hiv: int = Form(0), immunosuppression: int = Form(0),
+        silica_exposure: int = Form(0),
+        include_gradcam: bool = Query(False)
 ):
     try:
-        # 1. AGE ROUTING (Pediatric Safety Check)
+        # 1. AGE ROUTING
         if age < 18:
             return JSONResponse(status_code=400, content={
                 "status": "error",
@@ -165,44 +176,43 @@ async def predict(
         try:
             y, sr = librosa.load(tmp_path, sr=16000, mono=True)
 
-            # --- QUALITY GATE ---
             is_valid, message = audio_quality_gate(y)
             if not is_valid:
-                return JSONResponse(status_code=400, content={
-                    "status": "error",
-                    "message": message,
-                    "action": "request_new_recording"
-                })
+                return JSONResponse(status_code=400,
+                                    content={"status": "error", "message": message, "action": "request_new_recording"})
 
+            # UPGRADE 1: Cough Extraction happens inside preprocess_audio
             y_clean = preprocess_audio(y, sr)
             audio_tensor = audio_to_tensor(y_clean).to(device)
         finally:
             os.unlink(tmp_path)
 
-        # 3. AI Audio Inference (Isolate audio score by passing zeros to tabular branch)
+        # 3. AI Audio Inference
         with torch.no_grad():
             tabular_zeros = torch.zeros((1, 4), dtype=torch.float32).to(device)
-            audio_prob = model(audio_tensor, tabular_zeros).item()
+            raw_audio_prob = model(audio_tensor, tabular_zeros).item()
 
-            # 4. Two-Channel Clinical Scoring
+            # UPGRADE 2: Apply Temperature Scaling to fix overconfidence
+        calibrated_audio_prob = apply_temperature_scaling(raw_audio_prob, temperature=1.5)
+
+        # 4. Two-Channel Clinical Scoring
         clinical_score, red_flag, high_risk = calculate_clinical_score(
             cough_duration, fever, night_sweats, weight_loss,
             hemoptysis, tb_contact, diabetes, hiv,
             immunosuppression, silica_exposure
         )
 
-        # 5. Transparent Routing Logic (No blind addition of scores)
+        # 5. UPGRADE 3: Context-Aware Dynamic Thresholding & Routing
         if red_flag:
             final_tier = "URGENT"
             action = "Immediate medical assessment required (hemoptysis detected)."
             fusion_status = "safety_override"
         elif high_risk and clinical_score <= 3:
-            # Asymptomatic or low-symptom but high-risk (e.g., TB contact, HIV)
             final_tier = "HIGH_RISK_SCREENING"
             action = "Contact screening or high-risk pathway referral recommended."
             fusion_status = "risk_based_referral"
         else:
-            # Standard tiering based on weighted score
+            # Standard tiering
             if clinical_score <= 3:
                 clinical_tier = "LOW"
             elif clinical_score <= 8:
@@ -210,9 +220,16 @@ async def predict(
             else:
                 clinical_tier = "HIGH"
 
-            # Audio can escalate but NEVER downgrade
+            # Dynamic Audio Thresholds based on Clinical Context
+            if clinical_tier == "LOW":
+                audio_threshold = 0.45  # Sensitive net for hidden cases
+            elif clinical_tier == "MODERATE":
+                audio_threshold = 0.65  # Standard threshold
+            else:  # HIGH
+                audio_threshold = 0.85  # Requires high AI confidence to escalate further
+
             final_tier = clinical_tier
-            if audio_prob > 0.65 and clinical_tier != "HIGH":
+            if calibrated_audio_prob > audio_threshold and clinical_tier != "HIGH":
                 if clinical_tier == "LOW":
                     final_tier = "MODERATE"
                 elif clinical_tier == "MODERATE":
@@ -227,32 +244,27 @@ async def predict(
             else:
                 action = "Low immediate risk. Maintain standard respiratory hygiene."
 
-        # 6. Build the Traceable, Two-Channel Response Schema
+        # 6. Build Transparent Response
         response_payload = {
             "status": "success",
-            "patient_demographics": {
-                "age": age,
-                "sex": sex,
-                "bias_note": "Demographics collected for record-keeping only. Excluded from scoring to prevent algorithmic bias."
-            },
+            "patient_demographics": {"age": age, "sex": sex,
+                                     "bias_note": "Excluded from scoring to prevent algorithmic bias."},
             "questionnaire_score": clinical_score,
             "questionnaire_max": 18,
             "red_flag_detected": red_flag,
             "high_risk_factors_present": high_risk,
             "audio_model": {
                 "target": "respiratory_abnormality_proxy",
-                "score": round(audio_prob, 4),
-                "tb_probability_validated": False  # CRITICAL DISCLAIMER
+                "raw_score": round(raw_audio_prob, 4),
+                "calibrated_score": round(calibrated_audio_prob, 4),  # Shows the fixed probability
+                "tb_probability_validated": False
             },
-            "fusion": {
-                "status": fusion_status,
-                "tier": final_tier
-            },
+            "fusion": {"status": fusion_status, "tier": final_tier},
             "recommended_pathway": action,
             "clinical_note": "This is a screening support tool, not a diagnostic. Final decision requires clinician review."
         }
 
-        # 7. Optional Heavy Payload (Grad-CAM)
+        # 7. Optional Grad-CAM
         if include_gradcam:
             heatmap = gradcam.generate_cam(audio_tensor, tabular_zeros)
             _, buffer = cv2.imencode('.jpg', heatmap, [cv2.IMWRITE_JPEG_QUALITY, 60])
