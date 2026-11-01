@@ -1,84 +1,64 @@
-# src/gradcam.py
-import torch
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
+"""Optional spectrogram attribution debugger; no OpenCV dependency."""
+from __future__ import annotations
+import argparse
 from pathlib import Path
-from src.model import LateFusionTBModel
-
+import numpy as np
+import torch
+from src.common import ROOT, run_cli
+from src.audio import load_audio, mel_images
+from src.inference import Predictor
 
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
-        self.gradients = None
         self.activations = None
+        self._hook = target_layer.register_forward_hook(self._save_activation)
 
-        # Register hooks to capture gradients and activations
-        target_layer.register_forward_hook(self.save_activation)
-        target_layer.register_full_backward_hook(self.save_gradient)
+    def _save_activation(self, module, inputs, output):
+        self.activations = output
+        if output.requires_grad:
+            output.retain_grad()
 
-    def save_activation(self, module, input, output):
-        self.activations = output.detach()
+    def close(self):
+        self._hook.remove()
 
-    def save_gradient(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0].detach()
-
-    def generate_cam(self, audio_tensor, tabular_tensor):
+    def generate_cam(self, audio_tensor, tabular_tensor=None):
+        from matplotlib import colormaps
         self.model.eval()
-        self.model.zero_grad()
+        self.model.zero_grad(set_to_none=True)
+        with torch.enable_grad():
+            output = (self.model(audio_tensor, tabular_tensor) if tabular_tensor is not None
+                      else self.model(audio_tensor))
+            output.reshape(-1)[0].backward()
+        if self.activations is None or self.activations.grad is None:
+            raise RuntimeError("No attribution gradients; use a trainable CNN outside inference_mode.")
+        activation = self.activations.detach()
+        weights = self.activations.grad.mean(dim=(2, 3), keepdim=True)
+        cam = torch.relu((weights * activation).sum(dim=1, keepdim=True))
+        cam = torch.nn.functional.interpolate(cam, size=(224, 224), mode="bilinear", align_corners=False)
+        image = cam[0, 0].cpu().numpy()
+        image = (image - image.min()) / max(float(np.ptp(image)), 1e-8)
+        return (colormaps["jet"](image)[..., :3] * 255).astype(np.uint8)
 
-        # Forward pass
-        output = self.model(audio_tensor, tabular_tensor)
-
-        # Backward pass directly on the single sigmoid probability output
-        output[0].backward()
-
-        # Calculate CAM
-        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
-        cam = (weights * self.activations).sum(dim=1, keepdim=True)
-        cam = torch.relu(cam)  # Only positive influences
-
-        # Resize to 224x224
-        cam = torch.nn.functional.interpolate(cam, size=(224, 224), mode='bilinear', align_corners=False)
-        cam = cam.squeeze().cpu().numpy()
-
-        # Normalize to 0-1
-        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-        cam = np.uint8(255 * cam)
-
-        # Apply Jet colormap
-        heatmap = cv2.applyColorMap(cam, cv2.COLORMAP_JET)
-        return heatmap
-
-
-def test_gradcam():
-    print("🎨 Testing Grad-CAM Visualization...")
-    PROJECT_ROOT = Path(__file__).parent.parent
-    CACHE_DIR = PROJECT_ROOT / "cache"
-
-    # Load model
-    model = LateFusionTBModel()
-    model.load_state_dict(torch.load(CACHE_DIR / "late_fusion_model.pth", weights_only=True))
-    model.eval()
-
-    # Load one sample
-    cached_data = torch.load(CACHE_DIR / "spectrograms.pt", weights_only=True)
-    sample = cached_data[0]  # Just grab the first one for testing
-    audio_tensor = sample['tensor'].unsqueeze(0)  # Add batch dimension
-    tabular_tensor = torch.zeros((1, 4), dtype=torch.float32)  # Neutral tabular input
-
-    # Target the last convolutional layer of MobileNetV2
-    target_layer = model.audio_encoder.backbone.features[-1][0]
-
-    gradcam = GradCAM(model, target_layer)
-    heatmap = gradcam.generate_cam(audio_tensor, tabular_tensor)
-
-    # Save the heatmap
-    output_path = PROJECT_ROOT / "reports" / "gradcam_demo.jpg"
-    cv2.imwrite(str(output_path), heatmap)
-    print(f"✅ Grad-CAM heatmap saved to: {output_path}")
-    print("   (Open this image to see the red/yellow 'hotspots' on the spectrogram!)")
-
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--audio", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=ROOT / "artifacts/gradcam.png")
+    args = parser.parse_args()
+    predictor = Predictor(args.model)
+    if predictor.kind != "cnn":
+        raise ValueError("This debugger supports CNN bundles only.")
+    from matplotlib import pyplot as plt
+    debugger = GradCAM(predictor.model, predictor.model.audio_encoder.backbone.features[-1])
+    try:
+        windows = torch.from_numpy(mel_images(load_audio(args.audio)))
+        image = debugger.generate_cam(windows[:1])
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        plt.imsave(args.output, image)
+    finally:
+        debugger.close()
+    print(f"Saved {args.output}. Attribution shows network sensitivity, not a clinical explanation.")
 
 if __name__ == "__main__":
-    test_gradcam()
+    run_cli(main)

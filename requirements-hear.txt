@@ -1,0 +1,5 @@
+-r requirements.txt
+# Install matched CPU torch/torchvision separately; see README.
+transformers==4.50.3
+huggingface-hub==0.30.2
+safetensors>=0.4.3,<1
