@@ -1,0 +1,46 @@
+services:
+  clinical:
+    build:
+      context: .
+      dockerfile: Dockerfile.clinical
+    ports: ["127.0.0.1:8060:8060"]
+    user: "${SHWAAS_UID:-10001}:${SHWAAS_GID:-10001}"
+    environment:
+      SHWAAS_JWT_SECRET: ${SHWAAS_JWT_SECRET:?Run python -m server.clinical_setup first}
+      SHWAAS_DEMO_PASSWORD: ${SHWAAS_DEMO_PASSWORD:?Set a demo password}
+      SHWAAS_DATABASE_URL: sqlite:////app/data/shwaasai.db
+      SHWAAS_COOKIE_SECURE: "false"
+      ORTHANC_URL: http://orthanc:8042
+      ORTHANC_USER: clinical
+      ORTHANC_PASSWORD: ${ORTHANC_PASSWORD:?Set an archive password}
+      OHIF_URL: http://ohif/clinical/pacs/viewer
+    volumes: ["./data:/app/data"]
+    depends_on: [orthanc, ohif]
+    restart: unless-stopped
+  orthanc:
+    image: orthancteam/orthanc:26.9.1
+    environment:
+      ORTHANC__NAME: ShwaasAI Private Archive
+      ORTHANC__AUTHENTICATION_ENABLED: "true"
+      ORTHANC__REMOTE_ACCESS_ALLOWED: "true"
+      ORTHANC__REGISTERED_USERS: '{"clinical":"${ORTHANC_PASSWORD:?Set an archive password}"}'
+      ORTHANC__DICOM_SERVER_ENABLED: "false"
+      DICOM_WEB_PLUGIN_ENABLED: "true"
+      ORTHANC__DICOM_WEB__ENABLE: "true"
+      ORTHANC__DICOM_WEB__ROOT: /dicom-web/
+      ORTHANC__DICOM_WEB__ENABLE_WADO: "false"
+      VERBOSE_STARTUP: "false"
+    volumes: ["orthanc-data:/var/lib/orthanc/db"]
+    restart: unless-stopped
+  ohif:
+    # Public asset paths are baked into OHIF; a root-path image cannot be relocated by app-config alone.
+    build:
+      context: https://github.com/OHIF/Viewers.git#v3.13.13
+      args:
+        PUBLIC_URL: /clinical/pacs/viewer/
+        PORT: "80"
+    volumes:
+      - ./pacs/app-config.js:/usr/share/nginx/html/clinical/pacs/viewer/app-config.js:ro
+    restart: unless-stopped
+volumes:
+  orthanc-data:

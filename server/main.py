@@ -9,6 +9,7 @@ Phase 1 Extended API wrapping core ML with:
 
 import uuid
 import json
+import os
 from datetime import datetime, timezone
 from typing import Optional, List
 
@@ -25,7 +26,8 @@ from server.schemas import (
     ScreeningListItem, ReferralUpdateRequest, ReferralResponse, StatsResponse,
     TierEnum, PathwayCodeEnum, ReferralStatusEnum
 )
-from server.pipeline import run_screening_pipeline
+from server.clinical_access import visible_screenings, require_screening, screening_scope
+from server.clinical import install_clinical
 
 # Initialize database schema on startup
 init_db()
@@ -39,7 +41,7 @@ app = FastAPI(
 # Explicit CORS Origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permits mobile app, local emulators, and local tools
+    allow_origins=[x.strip() for x in os.getenv("SHWAAS_CORS_ORIGINS", "").split(",") if x.strip()],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["*"],
@@ -107,11 +109,13 @@ async def create_screening(
     hiv: int = Form(0),
     immunosuppression: int = Form(0),
     silica_exposure: int = Form(0),
-    consent_given: bool = Form(True),
+    consent_given: bool = Form(False),
     include_gradcam: bool = Query(False),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    if not consent_given:
+        raise HTTPException(422, "Consent is required before saving a screening.")
     # 1. Content-type and file size check
     if file.content_type and "wav" not in file.content_type.lower() and "octet-stream" not in file.content_type.lower():
         return JSONResponse(
@@ -124,7 +128,7 @@ async def create_screening(
             }
         )
 
-    audio_bytes = await file.read()
+    audio_bytes = await file.read(MAX_AUDIO_BYTES + 1)
     if len(audio_bytes) > MAX_AUDIO_BYTES:
         return JSONResponse(
             status_code=400,
@@ -151,6 +155,7 @@ async def create_screening(
 
     try:
         # 2. Run Pipeline
+        from server.pipeline import run_screening_pipeline
         result = await run_screening_pipeline(
             audio_bytes=audio_bytes,
             age=age,
@@ -267,9 +272,10 @@ def list_screenings(
     search: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    query = db.query(Screening).outerjoin(Referral)
+    query = visible_screenings(db, current_user).outerjoin(Referral)
 
     if tier:
         query = query.filter(Screening.tier == tier.value)
@@ -305,10 +311,8 @@ def list_screenings(
 
 # --- 5. SCREENING DETAIL ---
 @app.get("/screenings/{screening_id}")
-def get_screening_detail(screening_id: str, db: Session = Depends(get_db)):
-    screening = db.query(Screening).filter(Screening.id == screening_id).first()
-    if not screening:
-        raise HTTPException(status_code=404, detail="Screening record not found")
+def get_screening_detail(screening_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    screening = require_screening(db, current_user, screening_id)
 
     ref_status = screening.referral.status if screening.referral else "pending"
     ref_notes = screening.referral.notes if screening.referral else ""
@@ -350,8 +354,12 @@ def get_screening_detail(screening_id: str, db: Session = Depends(get_db)):
 def update_referral(
     screening_id: str,
     update_data: ReferralUpdateRequest,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    if current_user.role != "doctor":
+        raise HTTPException(403, "A clinician account is required.")
+    require_screening(db, current_user, screening_id)
     referral = db.query(Referral).filter(Referral.screening_id == screening_id).first()
     if not referral:
         raise HTTPException(status_code=404, detail="Referral record for this screening not found")
@@ -372,19 +380,19 @@ def update_referral(
 
 # --- 7. DASHBOARD & FIELD METRICS (STATS) ---
 @app.get("/stats", response_model=StatsResponse)
-def get_stats(db: Session = Depends(get_db)):
-    total = db.query(Screening).count()
+def get_stats(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    total = visible_screenings(db, current_user).count()
 
     # Tier counts
     tier_counts = {t.value: 0 for t in TierEnum}
-    tier_rows = db.query(Screening.tier, func.count(Screening.id)).group_by(Screening.tier).all()
+    tier_rows = db.query(Screening.tier, func.count(Screening.id)).filter(screening_scope(current_user)).group_by(Screening.tier).all()
     for tier_val, count in tier_rows:
         if tier_val in tier_counts:
             tier_counts[tier_val] = count
 
     # Referral counts
     referral_counts = {"pending": 0, "tested": 0, "lost": 0}
-    ref_rows = db.query(Referral.status, func.count(Referral.id)).group_by(Referral.status).all()
+    ref_rows = db.query(Referral.status, func.count(Referral.id)).join(Screening).filter(screening_scope(current_user)).group_by(Referral.status).all()
     for st, count in ref_rows:
         if st in referral_counts:
             referral_counts[st] = count
@@ -393,7 +401,7 @@ def get_stats(db: Session = Depends(get_db)):
     completion_rate = round((referral_counts["tested"] / total_referrals * 100), 1) if total_referrals > 0 else 0.0
 
     # Screenings by village
-    village_rows = db.query(Screening.village, func.count(Screening.id)).group_by(Screening.village).all()
+    village_rows = db.query(Screening.village, func.count(Screening.id)).filter(screening_scope(current_user)).group_by(Screening.village).all()
     screenings_by_village = {v: count for v, count in village_rows}
 
     return {
@@ -407,12 +415,14 @@ def get_stats(db: Session = Depends(get_db)):
 
 # --- 8. MEDICAL DOCUMENT & PRESCRIPTION OCR ---
 @app.post("/ocr/scan")
-async def scan_prescription_document(image: UploadFile = File(...)):
+async def scan_prescription_document(image: UploadFile = File(...), current_user: User = Depends(get_current_user)):
     """
     Real-time Tesseract OCR endpoint for medical prescription and OPD slip text extraction.
     Returns empty text if image contains no text (e.g. blank, dark object).
     """
-    contents = await image.read()
+    contents = await image.read(20 * 1024 * 1024 + 1)
+    if len(contents) > 20 * 1024 * 1024:
+        raise HTTPException(413, "Image is too large.")
     if not contents:
         return {"text": "", "length": 0}
 
@@ -437,3 +447,5 @@ async def scan_prescription_document(image: UploadFile = File(...)):
             "error": str(e),
             "status": "error"
         }
+
+install_clinical(app)

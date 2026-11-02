@@ -5,6 +5,7 @@ Uses SQLite for offline-first resilience.
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Boolean, Text, DateTime, ForeignKey
@@ -15,11 +16,11 @@ DB_DIR = Path(__file__).parent.parent / "data"
 DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "shwaasai.db"
 
-DATABASE_URL = f"sqlite:///{DB_PATH}"
+DATABASE_URL = os.getenv("SHWAAS_DATABASE_URL", f"sqlite:///{DB_PATH}")
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False}
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
