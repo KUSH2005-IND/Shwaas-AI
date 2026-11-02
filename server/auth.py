@@ -7,6 +7,9 @@ Authentication and security utilities for ShwaasAI:
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+import os
+import secrets
+from pathlib import Path
 import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, status
@@ -15,7 +18,26 @@ from sqlalchemy.orm import Session
 
 from server.db import get_db, User
 
-SECRET_KEY = "shwaasai-kartavya-innotech-2026-secret-key-production"
+def _secret_key():
+    configured = os.getenv("SHWAAS_JWT_SECRET", "")
+    if configured:
+        if len(configured) < 32:
+            raise RuntimeError("SHWAAS_JWT_SECRET must contain at least 32 characters.")
+        return configured
+    path = Path(__file__).resolve().parent.parent / "data" / ".jwt-secret"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "x", encoding="utf-8") as stream:
+            os.chmod(path, 0o600)
+            stream.write(secrets.token_urlsafe(48))
+    except FileExistsError:
+        pass
+    key = path.read_text(encoding="utf-8").strip()
+    if len(key) < 32:
+        raise RuntimeError("Local signing key is invalid. Configure SHWAAS_JWT_SECRET.")
+    return key
+
+SECRET_KEY = _secret_key()
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 

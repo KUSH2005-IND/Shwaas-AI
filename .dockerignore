@@ -1,0 +1,15 @@
+.git
+data
+cache
+clinical/node_modules
+clinical/dist
+**/__pycache__
+**/.env*
+.env*
+mobile
+models
+output
+venv
+.venv
+.venv-clinical
+.preview-deps

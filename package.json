@@ -1,0 +1,1 @@
+{"name":"shwaas-ai-workspace","private":true,"scripts":{"dev":"npm --prefix clinical run dev --","build":"npm --prefix clinical run build","test:clinical":"npm --prefix clinical test"}}

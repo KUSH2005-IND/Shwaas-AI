@@ -7,6 +7,10 @@ import pytest
 from pathlib import Path
 from httpx import AsyncClient, ASGITransport
 from server.main import app
+from server.auth import create_access_token
+
+def worker_headers(): return {"Authorization": "Bearer "+create_access_token({"sub":"asha_rani"})}
+def doctor_headers(): return {"Authorization": "Bearer "+create_access_token({"sub":"test_doctor"})}
 
 AUDIO_DIR = Path(__file__).parent.parent.parent / "fixtures" / "audio"
 
@@ -31,7 +35,7 @@ def clipping_wav_bytes():
 @pytest.mark.asyncio
 async def test_health_and_version():
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         res = await client.get("/health")
         assert res.status_code == 200
         assert res.json()["status"] == "healthy"
@@ -43,7 +47,7 @@ async def test_health_and_version():
 @pytest.mark.asyncio
 async def test_auth_login_success():
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         res = await client.post("/auth/login", json={"username": "asha_rani", "password": "asha123"})
         assert res.status_code == 200
         data = res.json()
@@ -55,18 +59,18 @@ async def test_auth_login_success():
 @pytest.mark.asyncio
 async def test_auth_login_failure():
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         res = await client.post("/auth/login", json={"username": "asha_rani", "password": "wrongpassword"})
         assert res.status_code == 401
 
 @pytest.mark.asyncio
 async def test_pediatric_gate(valid_wav_bytes):
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         res = await client.post(
             "/screenings",
             files={"file": ("cough.wav", valid_wav_bytes, "audio/wav")},
-            data={"age": 16, "village": "Sundarpur"}
+            data={"consent_given": "true", "age": 16, "village": "Sundarpur"}
         )
         assert res.status_code == 400
         data = res.json()
@@ -76,12 +80,12 @@ async def test_pediatric_gate(valid_wav_bytes):
 @pytest.mark.asyncio
 async def test_quality_gates(silence_wav_bytes, clipping_wav_bytes):
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         # Silence
         res_sil = await client.post(
             "/screenings",
             files={"file": ("cough.wav", silence_wav_bytes, "audio/wav")},
-            data={"age": 30}
+            data={"consent_given": "true", "age": 30}
         )
         assert res_sil.status_code == 400
         assert res_sil.json()["error_code"] == "AUDIO_QUALITY_REJECTED"
@@ -90,7 +94,7 @@ async def test_quality_gates(silence_wav_bytes, clipping_wav_bytes):
         res_clip = await client.post(
             "/screenings",
             files={"file": ("cough.wav", clipping_wav_bytes, "audio/wav")},
-            data={"age": 30}
+            data={"consent_given": "true", "age": 30}
         )
         assert res_clip.status_code == 400
         assert res_clip.json()["error_code"] == "AUDIO_QUALITY_REJECTED"
@@ -98,12 +102,12 @@ async def test_quality_gates(silence_wav_bytes, clipping_wav_bytes):
 @pytest.mark.asyncio
 async def test_create_screening_success_and_persist(valid_wav_bytes):
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         # 1. Post a new screening
         res = await client.post(
             "/screenings",
             files={"file": ("cough.wav", valid_wav_bytes, "audio/wav")},
-            data={
+            data={"consent_given": "true",
                 "age": 42,
                 "sex": "female",
                 "village": "Belagavi",
@@ -132,11 +136,11 @@ async def test_create_screening_success_and_persist(valid_wav_bytes):
 @pytest.mark.asyncio
 async def test_urgent_hemoptysis_override(valid_wav_bytes):
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         res = await client.post(
             "/screenings",
             files={"file": ("cough.wav", valid_wav_bytes, "audio/wav")},
-            data={"age": 50, "hemoptysis": 2}
+            data={"consent_given": "true", "age": 50, "hemoptysis": 2}
         )
         assert res.status_code == 200
         data = res.json()
@@ -147,11 +151,11 @@ async def test_urgent_hemoptysis_override(valid_wav_bytes):
 @pytest.mark.asyncio
 async def test_gradcam_generation(valid_wav_bytes):
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         res = await client.post(
             "/screenings?include_gradcam=true",
             files={"file": ("cough.wav", valid_wav_bytes, "audio/wav")},
-            data={"age": 35}
+            data={"consent_given": "true", "age": 35}
         )
         assert res.status_code == 200
         data = res.json()
@@ -161,7 +165,7 @@ async def test_gradcam_generation(valid_wav_bytes):
 @pytest.mark.asyncio
 async def test_list_screenings_and_filters():
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         # Default list
         res = await client.get("/screenings?limit=10")
         assert res.status_code == 200
@@ -183,7 +187,7 @@ async def test_list_screenings_and_filters():
 @pytest.mark.asyncio
 async def test_patch_referral_status():
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         # Fetch one screening
         res_list = await client.get("/screenings?limit=1")
         items = res_list.json()
@@ -193,6 +197,7 @@ async def test_patch_referral_status():
         # Update referral
         patch_res = await client.patch(
             f"/screenings/{screening_id}/referral",
+            headers=doctor_headers(),
             json={"status": "tested", "notes": "CBNAAT confirmed positive; DOTS treatment initiated."}
         )
         assert patch_res.status_code == 200
@@ -207,7 +212,7 @@ async def test_patch_referral_status():
 @pytest.mark.asyncio
 async def test_stats_endpoint():
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         res = await client.get("/stats")
         assert res.status_code == 200
         stats = res.json()
@@ -223,7 +228,7 @@ async def test_ocr_blank_and_text_image():
     from PIL import Image, ImageDraw
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://test", headers=worker_headers()) as client:
         # 1. Blank/black image must return empty text
         blank_img = Image.new("RGB", (200, 100), color="black")
         blank_bytes = io.BytesIO()
