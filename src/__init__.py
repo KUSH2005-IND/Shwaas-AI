@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from shwaasai!")
+"""ShwaasAI: reusable modules; importing this package performs no downloads."""

@@ -47,3 +47,13 @@ class LateFusionTBModel(nn.Module):
         tab_emb = self.tabular_encoder(tabular_input)
         fused = torch.cat((audio_emb, tab_emb), dim=1)
         return self.fusion_head(fused)
+
+class AudioOnlyModel(nn.Module):
+    """New audio-only model. Old fusion classes above retain checkpoint compatibility."""
+    def __init__(self):
+        super().__init__()
+        self.audio_encoder = AudioCNN()
+        self.head = nn.Sequential(nn.ReLU(), nn.Dropout(0.3), nn.Linear(128, 1))
+
+    def forward(self, audio_input):
+        return self.head(self.audio_encoder(audio_input)).reshape(-1)

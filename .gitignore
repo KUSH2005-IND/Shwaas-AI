@@ -83,3 +83,8 @@ desktop.ini
 .env.local
 *.key
 *.pem
+
+# Generated bundles, test state and build metadata
+artifacts/
+.pytest_cache/
+.ruff_cache/
