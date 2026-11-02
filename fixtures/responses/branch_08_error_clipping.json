@@ -1,0 +1,9 @@
+{
+  "status_code": 400,
+  "latency_ms": 9.6,
+  "response": {
+    "status": "error",
+    "message": "Audio is clipping (distorted). Please move the microphone further away.",
+    "action": "request_new_recording"
+  }
+}

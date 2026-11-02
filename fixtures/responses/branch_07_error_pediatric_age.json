@@ -1,0 +1,9 @@
+{
+  "status_code": 400,
+  "latency_ms": 6.21,
+  "response": {
+    "status": "error",
+    "message": "Patient is under 18. Pediatric TB screening requires a different clinical pathway.",
+    "action": "route_to_pediatric_protocol"
+  }
+}

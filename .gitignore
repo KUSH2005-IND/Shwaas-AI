@@ -46,6 +46,11 @@ cache/
 *.npy
 *.joblib
 
+# Allow bundled demo audio for app pitch and test verification
+!mobile/assets/**/*.wav
+!fixtures/*.wav
+!fixtures/**/*.wav
+
 # ==========================================
 # Hugging Face & Local Caches
 # ==========================================

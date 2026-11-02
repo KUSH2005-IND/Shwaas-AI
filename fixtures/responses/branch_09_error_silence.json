@@ -1,0 +1,9 @@
+{
+  "status_code": 400,
+  "latency_ms": 9.13,
+  "response": {
+    "status": "error",
+    "message": "Audio is too quiet. Please ensure the microphone is close to the patient.",
+    "action": "request_new_recording"
+  }
+}

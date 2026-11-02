@@ -1,0 +1,28 @@
+{
+  "status_code": 200,
+  "latency_ms": 309.38,
+  "response": {
+    "status": "success",
+    "patient_demographics": {
+      "age": 60,
+      "sex": "male",
+      "bias_note": "Excluded from scoring to prevent algorithmic bias."
+    },
+    "questionnaire_score": 10,
+    "questionnaire_max": 18,
+    "red_flag_detected": false,
+    "high_risk_factors_present": false,
+    "audio_model": {
+      "target": "respiratory_abnormality_proxy",
+      "raw_score": 0.0174,
+      "calibrated_score": 0.0637,
+      "tb_probability_validated": false
+    },
+    "fusion": {
+      "status": "finalized",
+      "tier": "HIGH"
+    },
+    "recommended_pathway": "Urgent referral for CBNAAT testing recommended.",
+    "clinical_note": "This is a screening support tool, not a diagnostic. Final decision requires clinician review."
+  }
+}
